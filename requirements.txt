@@ -1,4 +1,4 @@
-python-telegram-bot==21.9
+python-telegram-bot[job-queue]==21.9
 requests==2.31.0
 matplotlib==3.9.4
 pillow==11.1.0
