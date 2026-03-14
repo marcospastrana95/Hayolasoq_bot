@@ -26,6 +26,7 @@ from fetcher import (
 from scorer import score_spot, degrees_to_dir
 from tides import get_tides, format_tides_block
 from chart import generate_chart, analyze_trend
+from ai_briefing import generate_ai_briefing
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
@@ -159,7 +160,7 @@ def zona_keyboard(island, best_zona):
 
 async def send_zona_report(chat_id, island, zona, ctx):
     day_str = datetime.now().strftime("%Y-%m-%d")
-    await ctx.bot.send_message(chat_id=chat_id, text="⏳ Consultando datos detallados...")
+    await ctx.bot.send_message(chat_id=chat_id, text="⏳ Consultando datos...")
 
     if island == "graciosa":
         spots    = SPOTS["graciosa"]
@@ -175,6 +176,9 @@ async def send_zona_report(chat_id, island, zona, ctx):
         await ctx.bot.send_message(chat_id=chat_id, text="❌ Sin datos para esta zona.")
         return
 
+    # Mareas (enriquecen el análisis de la IA)
+    tide_data = get_tides(island)
+
     hourly_by_spot = {s["name"]: hourly for s in spots}
     entry_ref      = _ref_entry(hourly, day_str) or {}
     swell_summary  = {
@@ -185,10 +189,10 @@ async def send_zona_report(chat_id, island, zona, ctx):
         "wd":  degrees_to_dir(entry_ref.get("wind_direction") or 0),
     }
 
+    # ── Imagen heatmap ────────────────────────────────────────────────────────
     try:
         img_bytes  = generate_chart(
-            island=island if island == "graciosa" else zona,
-            spots=spots, hourly_by_spot=hourly_by_spot,
+            island=island, spots=spots, hourly_by_spot=hourly_by_spot,
             day_str=day_str, swell_summary=swell_summary,
         )
         zona_label = ZONAS_TENERIFE.get(zona, {}).get("label", zona.capitalize()) \
@@ -198,40 +202,74 @@ async def send_zona_report(chat_id, island, zona, ctx):
     except Exception as e:
         logger.warning(f"Error imagen: {e}")
 
-    try:
-        trend_txt = analyze_trend(hourly, spots, day_str)
-        if trend_txt:
-            await ctx.bot.send_message(chat_id=chat_id, text=trend_txt, parse_mode="Markdown")
-    except Exception as e:
-        logger.warning(f"Error tendencia: {e}")
-
-    lines = []
+    # ── Calcular scores por spot (referencia horaria múltiple) ────────────────
+    spots_data = []
     for spot in spots:
-        entry = _ref_entry(hourly, day_str)
-        if not entry: continue
-        conds = {**entry, "tide_state": get_tide_state(10)}
-        res   = score_spot(spot, conds, hora=10)
-        sh    = entry.get("swell_height") or entry.get("wave_height") or 0
-        sp    = entry.get("swell_period") or entry.get("wave_period") or 0
-        sd    = degrees_to_dir(entry.get("swell_direction") or entry.get("wave_direction") or 0)
-        ws    = entry.get("wind_speed") or 0
-        wd    = degrees_to_dir(entry.get("wind_direction") or 0)
-        sem   = SEMAFORO[res["semaforo"]]
-        tipo  = TIPO_EMOJI.get(spot["type"], "🌊")
-        best  = get_best_hours(hourly, spot, day_str)
-        lines.append(f"{sem} {tipo} *{spot['name']}*")
-        lines.append(f"   ↗ {sh:.1f}m · {sp:.0f}s · {sd} | 💨 {wd} {ws:.0f}kts")
-        if best and best[0][1] >= 30:
-            h_str = " ".join([f"{h:02d}h{SEMAFORO[s]}" for h, _, s in best[:2]])
-            lines.append(f"   ⏰ Mejor: {h_str}")
-        if res["penalizaciones"]:
-            lines.append(f"   ⚠️ _{res['penalizaciones'][0]}_")
-        lines.append("")
+        # Usar la mejor hora del día para el score de referencia (no solo las 10h)
+        best_score_hora = 0
+        best_entry      = _ref_entry(hourly, day_str)
+        best_hora       = 10
+        for entry in (e for e in hourly if e["time"].startswith(day_str)):
+            try:
+                h = int(entry["time"][11:13]) if "T" in entry["time"] else int(entry["time"][8:10])
+                if not (6 <= h <= 20): continue
+                r = score_spot(spot, {**entry, "tide_state": get_tide_state(h)}, hora=h)
+                if r["score"] > best_score_hora:
+                    best_score_hora = r["score"]
+                    best_entry      = entry
+                    best_hora       = h
+            except Exception:
+                pass
 
-    if lines:
-        source = "Open-Meteo" if not stormglass_available(STORMGLASS_KEY) else "Stormglass + Open-Meteo"
-        lines.append(f"_Datos: {source}_")
-        await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
+        if not best_entry: continue
+        res = score_spot(spot, {**best_entry, "tide_state": get_tide_state(best_hora)}, hora=best_hora)
+        sh  = best_entry.get("swell_height") or best_entry.get("wave_height") or 0
+        sp  = best_entry.get("swell_period") or best_entry.get("wave_period") or 0
+        sd  = degrees_to_dir(best_entry.get("swell_direction") or best_entry.get("wave_direction") or 0)
+        ws  = best_entry.get("wind_speed") or 0
+        wd  = degrees_to_dir(best_entry.get("wind_direction") or 0)
+
+        spots_data.append({
+            "name": spot["name"], "score": res["score"],
+            "semaforo": res["semaforo"], "penalizaciones": res["penalizaciones"],
+            "sh": sh, "sp": sp, "sd": sd, "ws": ws, "wd": wd,
+            "hora_ref": best_hora,
+            "marea": get_tide_state(best_hora),
+        })
+
+    # ── Briefing IA (decisión principal) ─────────────────────────────────────
+    if spots_data:
+        try:
+            ai_text = await generate_ai_briefing(
+                island=island, day_str=day_str,
+                spots_data=spots_data, hourly=hourly,
+                tide_data=tide_data,
+            )
+            if ai_text:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🤖 *Decisión IA*\n\n{ai_text}",
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            logger.warning(f"Error briefing IA: {e}")
+            # Fallback: tabla básica si la IA falla
+            source = "Open-Meteo" if not stormglass_available(STORMGLASS_KEY) else "Stormglass"
+            lines  = []
+            for s in spots_data:
+                sem  = SEMAFORO[s["semaforo"]]
+                tipo = TIPO_EMOJI.get(
+                    next((sp["type"] for sp in spots if sp["name"] == s["name"]), ""), "🌊"
+                )
+                lines.append(f"{sem} {tipo} *{s['name']}* — {s['score']}/100")
+                lines.append(f"   {s['sh']:.1f}m {s['sp']:.0f}s {s['sd']} | {s['ws']:.0f}kts {s['wd']}")
+                if s["penalizaciones"]:
+                    lines.append(f"   ⚠️ _{s['penalizaciones'][0]}_")
+                lines.append("")
+            lines.append(f"_Datos: {source}_")
+            await ctx.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
+
+
 
 def build_smart_briefing(island, day_str=None):
     if day_str is None:
@@ -370,9 +408,14 @@ async def daily_briefing(ctx: ContextTypes.DEFAULT_TYPE):
     island   = user_island.get(chat_id, "tenerife")
     day_str  = datetime.now().strftime("%Y-%m-%d")
 
-    _, hourly      = get_best_zone_for_island(island, STORMGLASS_KEY)
+    _, hourly = get_best_zone_for_island(island, STORMGLASS_KEY)
+    if not hourly:
+        await ctx.bot.send_message(chat_id=chat_id, text="❌ Sin datos de oleaje hoy.")
+        return
+
+    tide_data      = get_tides(island)
     hourly_by_spot = {spot["name"]: hourly for spot in SPOTS[island]}
-    entry_ref      = _ref_entry(hourly, day_str) if hourly else {}
+    entry_ref      = _ref_entry(hourly, day_str) or {}
     swell_summary  = {
         "sh1": entry_ref.get("swell_height") or entry_ref.get("wave_height") or 0,
         "sp1": entry_ref.get("swell_period") or entry_ref.get("wave_period") or 0,
@@ -381,6 +424,7 @@ async def daily_briefing(ctx: ContextTypes.DEFAULT_TYPE):
         "wd":  degrees_to_dir(entry_ref.get("wind_direction") or 0),
     }
 
+    # ── Imagen ────────────────────────────────────────────────────────────────
     try:
         img_bytes = generate_chart(island=island, spots=SPOTS[island],
                                     hourly_by_spot=hourly_by_spot,
@@ -390,13 +434,60 @@ async def daily_briefing(ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"Error imagen: {e}")
 
-    try:
-        trend_txt = analyze_trend(hourly, SPOTS[island], day_str)
-        if trend_txt:
-            await ctx.bot.send_message(chat_id=chat_id, text=trend_txt, parse_mode="Markdown")
-    except Exception as e:
-        logger.warning(f"Error tendencia: {e}")
+    # ── Score por mejor hora para cada spot (no solo las 10h) ─────────────────
+    spots_data = []
+    for spot in SPOTS[island]:
+        best_score_hora = 0
+        best_entry      = _ref_entry(hourly, day_str)
+        best_hora       = 10
+        for entry in (e for e in hourly if e["time"].startswith(day_str)):
+            try:
+                h = int(entry["time"][11:13]) if "T" in entry["time"] else int(entry["time"][8:10])
+                if not (6 <= h <= 20): continue
+                r = score_spot(spot, {**entry, "tide_state": get_tide_state(h)}, hora=h)
+                if r["score"] > best_score_hora:
+                    best_score_hora = r["score"]
+                    best_entry = entry
+                    best_hora  = h
+            except Exception:
+                pass
+        if not best_entry: continue
+        res = score_spot(spot, {**best_entry, "tide_state": get_tide_state(best_hora)}, hora=best_hora)
+        spots_data.append({
+            "name": spot["name"], "score": res["score"],
+            "semaforo": res["semaforo"], "penalizaciones": res["penalizaciones"],
+            "sh": best_entry.get("swell_height") or best_entry.get("wave_height") or 0,
+            "sp": best_entry.get("swell_period") or best_entry.get("wave_period") or 0,
+            "sd": degrees_to_dir(best_entry.get("swell_direction") or best_entry.get("wave_direction") or 0),
+            "ws": best_entry.get("wind_speed") or 0,
+            "wd": degrees_to_dir(best_entry.get("wind_direction") or 0),
+            "hora_ref": best_hora,
+            "marea": get_tide_state(best_hora),
+        })
 
+    # ── Decisión IA ───────────────────────────────────────────────────────────
+    if spots_data:
+        try:
+            ai_text = await generate_ai_briefing(
+                island=island, day_str=day_str,
+                spots_data=spots_data, hourly=hourly,
+                tide_data=tide_data,
+            )
+            if ai_text:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🤖 *Decisión IA*\n\n{ai_text}",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📋 Ver zona completa", callback_data="ver_todos"),
+                        InlineKeyboardButton("👌 No gracias",        callback_data="no_gracias"),
+                    ]])
+                )
+                return  # Si la IA funcionó, no hace falta el briefing estático
+        except Exception as e:
+            logger.warning(f"Error AI briefing daily: {e}")
+
+    # Fallback si la IA falla: briefing estático clásico
     msg, _ = build_smart_briefing(island)
     await ctx.bot.send_message(
         chat_id=chat_id, text=msg, parse_mode="Markdown",
@@ -405,6 +496,8 @@ async def daily_briefing(ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("👌 No gracias",          callback_data="no_gracias"),
         ]])
     )
+
+
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
